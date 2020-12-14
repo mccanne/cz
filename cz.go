@@ -47,7 +47,7 @@ func main() {
 		}
 	}
 	zctx := resolver.NewContext()
-	w := zngio.NewWriter(&nopCloser{os.Stdout}, zngio.WriterOpts{})
+	w := zngio.NewWriter(&nopCloser{os.Stdout}, zngio.WriterOpts{LZ4BlockSize: zngio.DefaultLZ4BlockSize})
 	r := csv.NewReader(os.Stdin)
 	var c *converter
 	var line int

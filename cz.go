@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/csv"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,13 +10,28 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/brimsec/zq/field"
+	"github.com/brimsec/zq/zio/zngio"
+	"github.com/brimsec/zq/zng"
+	"github.com/brimsec/zq/zng/builder"
+	"github.com/brimsec/zq/zng/resolver"
+	"github.com/brimsec/zq/zng/typevector"
 )
 
-// takes stdin as csv and outputs as json
+// takes stdin as csv and send binary zng to stdout
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: cj [-s]")
+	fmt.Fprintln(os.Stderr, "usage: cz [-s]")
 	os.Exit(1)
+}
+
+type nopCloser struct {
+	io.Writer
+}
+
+func (*nopCloser) Close() error {
+	return nil
 }
 
 func main() {
@@ -32,59 +46,113 @@ func main() {
 			usage()
 		}
 	}
+	zctx := resolver.NewContext()
+	w := zngio.NewWriter(&nopCloser{os.Stdout}, zngio.WriterOpts{})
 	r := csv.NewReader(os.Stdin)
-	var hdr []string
-	object := make(map[string]interface{})
+	var c *converter
 	var line int
 	for {
-		rec, err := r.Read()
+		csvRec, err := r.Read()
 		if err != nil {
 			if err == io.EOF {
+				w.Close()
 				return
 			}
 			log.Fatal(err)
 		}
 		line++
-		if hdr == nil {
-			hdr = rec
+		if c == nil {
+			c = newConverter(zctx, csvRec, stringsOnly)
 			continue
 		}
-		if err := translate(hdr, rec, object, stringsOnly); err != nil {
+		rec, err := c.translate(csvRec)
+		if err != nil {
+			log.Fatal(fmt.Errorf("line %d: %s", line, err))
+		}
+		if err := w.Write(rec); err != nil {
 			log.Fatal(fmt.Errorf("line %d: %s", line, err))
 		}
 	}
 }
 
-func translate(hdr, rec []string, object map[string]interface{}, stringsOnly bool) error {
-	if len(hdr) != len(rec) {
-		return errors.New("length of record doesn't match heading")
+type converter struct {
+	zctx        *resolver.Context
+	types       *typevector.Table
+	hdr         []string
+	stringsOnly bool
+	builder     *builder.ColumnBuilder
+	cache       []zng.Value
+	recTypes    map[int]*zng.TypeRecord
+}
+
+func newConverter(zctx *resolver.Context, hdr []string, stringsOnly bool) *converter {
+	var fields []field.Static
+	for _, name := range hdr {
+		fields = append(fields, field.New(name))
 	}
-	for k, field := range hdr {
-		val := rec[k]
-		if stringsOnly {
-			object[field] = val
-		}
-		lower := strings.ToLower(val)
+	b, _ := builder.NewColumnBuilder(zctx, fields)
+	return &converter{
+		zctx:        zctx,
+		hdr:         hdr,
+		builder:     b,
+		types:       typevector.NewTable(),
+		cache:       make([]zng.Value, len(hdr)),
+		recTypes:    make(map[int]*zng.TypeRecord),
+		stringsOnly: stringsOnly,
+	}
+}
+
+func (c *converter) translate(fields []string) (*zng.Record, error) {
+	if len(fields) != len(c.cache) {
+		return nil, errors.New("length of record doesn't match heading")
+	}
+	vals := c.cache[:0]
+	for _, field := range fields {
+		//if stringsOnly {
+		//	object[field] = val
+		//}
+		var zv zng.Value
+		lower := strings.ToLower(field)
 		if lower == "+inf" || lower == "inf" {
-			object[field] = math.MaxFloat64
+			zv = zng.NewFloat64(math.MaxFloat64)
 		} else if lower == "-inf" {
-			object[field] = -math.MaxFloat64
+			zv = zng.NewFloat64(-math.MaxFloat64)
 		} else if lower == "nan" {
-			object[field] = "NaN"
-		} else if strings.TrimSpace(val) == "" {
-			object[field] = nil
-		} else if v, err := strconv.ParseFloat(val, 64); err == nil {
-			object[field] = v
-		} else if v, err := strconv.ParseBool(val); err == nil {
-			object[field] = v
+			zv = zng.NewFloat64(math.NaN())
+		} else if strings.TrimSpace(field) == "" {
+			zv = zng.Value{zng.TypeNull, nil}
+		} else if v, err := strconv.ParseFloat(field, 64); err == nil {
+			zv = zng.NewFloat64(v)
+		} else if v, err := strconv.ParseBool(field); err == nil {
+			zv = zng.NewBool(v)
 		} else {
-			object[field] = val
+			zv = zng.NewString(field)
 		}
+		vals = append(vals, zv)
 	}
-	b, err := json.Marshal(object)
-	if err != nil {
-		return err
+	if len(vals) != len(c.hdr) {
+		return nil, errors.New("values columns don't match header columns")
 	}
-	fmt.Println(string(b))
-	return nil
+	id := c.types.LookupByValues(vals)
+	typ, ok := c.recTypes[id]
+	if !ok {
+		types := make([]zng.Type, 0, len(vals))
+		for _, v := range vals {
+			types = append(types, v.Type)
+		}
+		cols := c.builder.TypedColumns(types)
+		var err error
+		typ, err = c.zctx.LookupTypeRecord(cols)
+		if err != nil {
+			return nil, err
+		}
+		c.recTypes[id] = typ
+	}
+	b := c.builder
+	b.Reset()
+	for _, zv := range vals {
+		b.Append(zv.Bytes, false)
+	}
+	bytes, _ := b.Encode()
+	return zng.NewRecord(typ, bytes), nil
 }

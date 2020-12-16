@@ -11,12 +11,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/brimsec/zq/field"
 	"github.com/brimsec/zq/zio/zngio"
 	"github.com/brimsec/zq/zng"
-	"github.com/brimsec/zq/zng/builder"
-	"github.com/brimsec/zq/zng/resolver"
-	"github.com/brimsec/zq/zng/typevector"
+	"github.com/mccanne/z"
 )
 
 // takes stdin as csv and send binary zng to stdout
@@ -46,7 +43,6 @@ func main() {
 			usage()
 		}
 	}
-	zctx := resolver.NewContext()
 	w := zngio.NewWriter(&nopCloser{os.Stdout}, zngio.WriterOpts{LZ4BlockSize: zngio.DefaultLZ4BlockSize})
 	r := csv.NewReader(os.Stdin)
 	var c *converter
@@ -62,7 +58,7 @@ func main() {
 		}
 		line++
 		if c == nil {
-			c = newConverter(zctx, csvRec, stringsOnly)
+			c = newConverter(csvRec, stringsOnly)
 			continue
 		}
 		rec, err := c.translate(csvRec)
@@ -76,83 +72,57 @@ func main() {
 }
 
 type converter struct {
-	zctx        *resolver.Context
-	types       *typevector.Table
-	hdr         []string
-	stringsOnly bool
-	builder     *builder.ColumnBuilder
-	cache       []zng.Value
-	recTypes    map[int]*zng.TypeRecord
+	builder *z.Builder
+	strings bool
+	hdr     []string
+	vals    []interface{}
 }
 
-func newConverter(zctx *resolver.Context, hdr []string, stringsOnly bool) *converter {
-	var fields []field.Static
-	for _, name := range hdr {
-		fields = append(fields, field.New(name))
-	}
-	b, _ := builder.NewColumnBuilder(zctx, fields)
+func newConverter(hdr []string, stringsOnly bool) *converter {
 	return &converter{
-		zctx:        zctx,
-		hdr:         hdr,
-		builder:     b,
-		types:       typevector.NewTable(),
-		cache:       make([]zng.Value, len(hdr)),
-		recTypes:    make(map[int]*zng.TypeRecord),
-		stringsOnly: stringsOnly,
+		builder: z.NewBuilder(),
+		hdr:     hdr,
+		vals:    make([]interface{}, len(hdr)),
+		strings: stringsOnly,
 	}
 }
 
 func (c *converter) translate(fields []string) (*zng.Record, error) {
-	if len(fields) != len(c.cache) {
+	if len(fields) != len(c.vals) {
 		return nil, errors.New("length of record doesn't match heading")
 	}
-	vals := c.cache[:0]
+	vals := c.vals[:0]
 	for _, field := range fields {
-		//if stringsOnly {
-		//	object[field] = val
-		//}
-		var zv zng.Value
-		lower := strings.ToLower(field)
-		if lower == "+inf" || lower == "inf" {
-			zv = zng.NewFloat64(math.MaxFloat64)
-		} else if lower == "-inf" {
-			zv = zng.NewFloat64(-math.MaxFloat64)
-		} else if lower == "nan" {
-			zv = zng.NewFloat64(math.NaN())
-		} else if strings.TrimSpace(field) == "" {
-			zv = zng.Value{zng.TypeNull, nil}
-		} else if v, err := strconv.ParseFloat(field, 64); err == nil {
-			zv = zng.NewFloat64(v)
-		} else if v, err := strconv.ParseBool(field); err == nil {
-			zv = zng.NewBool(v)
+		if c.strings {
+			vals = append(vals, field)
 		} else {
-			zv = zng.NewString(field)
+			vals = append(vals, convertString(field))
 		}
-		vals = append(vals, zv)
 	}
-	if len(vals) != len(c.hdr) {
-		return nil, errors.New("values columns don't match header columns")
+	return c.builder.FromFields(c.hdr, vals)
+}
+
+func convertString(s string) interface{} {
+	lower := strings.ToLower(s)
+	switch lower {
+	case "+inf", "inf":
+		return math.MaxFloat64
+	case "-inf":
+		return -math.MaxFloat64
+	case "nan":
+		return math.NaN()
+	case "":
+		// XXX library should handle coding nil value slice...
+		// for now it crashes and we insert this so we get
+		// a null(null) instead of an unset column
+		var v interface{}
+		return &v
 	}
-	id := c.types.LookupByValues(vals)
-	typ, ok := c.recTypes[id]
-	if !ok {
-		types := make([]zng.Type, 0, len(vals))
-		for _, v := range vals {
-			types = append(types, v.Type)
-		}
-		cols := c.builder.TypedColumns(types)
-		var err error
-		typ, err = c.zctx.LookupTypeRecord(cols)
-		if err != nil {
-			return nil, err
-		}
-		c.recTypes[id] = typ
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		return v
 	}
-	b := c.builder
-	b.Reset()
-	for _, zv := range vals {
-		b.Append(zv.Bytes, false)
+	if v, err := strconv.ParseBool(s); err == nil {
+		return v
 	}
-	bytes, _ := b.Encode()
-	return zng.NewRecord(typ, bytes), nil
+	return s
 }

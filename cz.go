@@ -13,7 +13,7 @@ import (
 
 	"github.com/brimsec/zq/zio/zngio"
 	"github.com/brimsec/zq/zng"
-	"github.com/mccanne/z"
+	"github.com/brimsec/zq/zng/resolver"
 )
 
 // takes stdin as csv and send binary zng to stdout
@@ -72,18 +72,18 @@ func main() {
 }
 
 type converter struct {
-	builder *z.Builder
-	strings bool
-	hdr     []string
-	vals    []interface{}
+	marshaler *resolver.MarshalContext
+	strings   bool
+	hdr       []string
+	vals      []interface{}
 }
 
 func newConverter(hdr []string, stringsOnly bool) *converter {
 	return &converter{
-		builder: z.NewBuilder(),
-		hdr:     hdr,
-		vals:    make([]interface{}, len(hdr)),
-		strings: stringsOnly,
+		marshaler: resolver.NewMarshaler(),
+		hdr:       hdr,
+		vals:      make([]interface{}, len(hdr)),
+		strings:   stringsOnly,
 	}
 }
 
@@ -99,7 +99,7 @@ func (c *converter) translate(fields []string) (*zng.Record, error) {
 			vals = append(vals, convertString(field))
 		}
 	}
-	return c.builder.FromFields(c.hdr, vals)
+	return c.marshaler.MarshalCustom(c.hdr, vals)
 }
 
 func convertString(s string) interface{} {
@@ -112,11 +112,7 @@ func convertString(s string) interface{} {
 	case "nan":
 		return math.NaN()
 	case "":
-		// XXX library should handle coding nil value slice...
-		// for now it crashes and we insert this so we get
-		// a null(null) instead of an unset column
-		var v interface{}
-		return &v
+		return nil
 	}
 	if v, err := strconv.ParseFloat(s, 64); err == nil {
 		return v

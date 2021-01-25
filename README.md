@@ -1,6 +1,6 @@
-# cz - csv to zng
+# cz - convert csv to zng
 
-cz takes CSV data on stdin and converts to ZNG.
+cz takes CSV data on stdin and converts to to ZNG on stdout.
 
 ## Install
 
